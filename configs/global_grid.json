@@ -1,0 +1,147 @@
+{
+  "datasets": {
+    "caltech101": {
+      "beta": [
+        0.5,
+        3,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        1,
+        10
+      ],
+      "candidate_count": 200
+    },
+    "oxford_pets": {
+      "beta": [
+        0.01,
+        5,
+        40
+      ],
+      "lambda_": [
+        0.01,
+        0.3,
+        20
+      ],
+      "candidate_count": 800
+    },
+    "stanford_cars": {
+      "beta": [
+        0.1,
+        10,
+        5
+      ],
+      "lambda_": [
+        0.01,
+        1,
+        5
+      ],
+      "candidate_count": 25
+    },
+    "oxford_flowers": {
+      "beta": [
+        0.1,
+        10,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        10,
+        100
+      ],
+      "candidate_count": 2000
+    },
+    "food101": {
+      "beta": [
+        0.5,
+        3,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        1,
+        10
+      ],
+      "candidate_count": 200
+    },
+    "fgvc": {
+      "beta": [
+        0.5,
+        3,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        1,
+        10
+      ],
+      "candidate_count": 200
+    },
+    "sun397": {
+      "beta": [
+        0.1,
+        10,
+        20
+      ],
+      "lambda_": [
+        0.01,
+        10,
+        10
+      ],
+      "candidate_count": 200
+    },
+    "dtd": {
+      "beta": [
+        0.1,
+        10,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        10,
+        100
+      ],
+      "candidate_count": 2000
+    },
+    "eurosat": {
+      "beta": [
+        0.5,
+        3,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        1,
+        100
+      ],
+      "candidate_count": 2000
+    },
+    "ucf101": {
+      "beta": [
+        0.5,
+        3,
+        20
+      ],
+      "lambda_": [
+        0.001,
+        1,
+        10
+      ],
+      "candidate_count": 200
+    },
+    "imagenet": {
+      "beta": [
+        1.5,
+        3,
+        10
+      ],
+      "lambda_": [
+        0.05,
+        0.25,
+        10
+      ],
+      "candidate_count": 100
+    }
+  }
+}
