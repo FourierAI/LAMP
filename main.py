@@ -9,14 +9,13 @@ import argparse
 import gzip
 import hashlib
 import json
-import platform
 import time
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-from PIL import Image, __version__ as pillow_version
+from PIL import Image
 import torchvision
 from torchvision import transforms as T
 from torchvision.transforms import functional as TF
@@ -24,6 +23,7 @@ from torchvision.transforms import functional as TF
 from clip_model import build_model
 from kernels import global_kernel, prior, residual, set_kernels
 from portable_math import global_gram, region_gram, solve, numerical_residual, global_response, configure, center_support
+from runtime_checks import execution_environment, record_runtime
 
 HERE = Path(__file__).resolve().parent
 EQUAL = (1/3, 1/3, 1/3)
@@ -247,8 +247,6 @@ def select(args):
         print(f'Global candidates {len(rows)}/{expected_global}; best={best["row"]["validation_correct"]}', flush=True)
     write(args.output / 'global_candidates.json', rows)
     beta, lam = best['row']['beta'], best['row']['lambda']
-    # Fixed selected kernels also supply the exact prototype response B = L S.
-    response_global = solve(global_gram(s['features'], beta), s['features'], lam)
     zero = dict(rho=0., ratio=1., weights=list(EQUAL), validation_correct=best['row']['validation_correct'])
     chosen, regional_rows, branches, diagnostics = zero, [zero], {}, {}
     for ratio in RATIOS:
@@ -259,7 +257,7 @@ def select(args):
             alpha = solve(gram, target, lam)
             check = numerical_residual(gram, target, alpha, lam)
             if check['backward_error'] >= 1e-6: raise RuntimeError('Unstable regional solve')
-            branch = dict(alpha=alpha, state=state, beta=beta*ratio, response=solve(gram, s['features'], lam))
+            branch = dict(alpha=alpha, state=state, beta=beta*ratio)
             branches[(ratio, index)] = branch
             diagnostics[str((ratio, index))] = check
             terms.append(native_delta(xq, xs, branch))
@@ -278,7 +276,7 @@ def select(args):
                      feature_sha256={name: sha(args.output / (name + '.pt')) for name in ('support', 'validation', 'text')},
                      fit_select_seconds=time.perf_counter()-began, diagnostics=diagnostics)
     selected_branches = [branches[(chosen['ratio'], i)] for i in range(3)] if chosen['rho'] else []
-    torch.save(cpu(dict(alpha=best['alpha'], response_global=response_global, branches=selected_branches, selection=selection)), args.output / 'model.pt')
+    torch.save(cpu(dict(alpha=best['alpha'], branches=selected_branches, selection=selection)), args.output / 'model.pt')
     selection['model_sha256'] = sha(args.output / 'model.pt')
     write(args.output / 'selection.json', selection)
     print('Selection sealed:', json.dumps(selection['regional_parameters']), flush=True)
@@ -286,11 +284,7 @@ def select(args):
 
 @torch.inference_mode()
 def evaluate(args):
-    selection = json.loads((args.output / 'selection.json').read_text())
-    if sha(args.output / 'model.pt') != selection['model_sha256']: raise RuntimeError('Selected model changed')
-    for name, expected in selection['feature_sha256'].items():
-        if sha(args.output / (name + '.pt')) != expected: raise RuntimeError('Fit input changed: ' + name)
-    model = device_copy(torch.load(args.output / 'model.pt', weights_only=True, map_location='cpu'), args.device)
+    selection, model = load_selected_model(args)
     s, q, text = [load_feature(args, x) for x in ('support', 'test', 'text')]
     row, beta = selection['regional_parameters'], selection['global_parameters']['beta']
     p = prior(q['features'], text)
@@ -299,7 +293,8 @@ def evaluate(args):
     scores = {'GLOBAL': p + delta, 'LAMP': mix(p, delta, terms, row)}
     if args.method == 'both':
         adapted = load_adapted(args)
-        response = response_scores(q, s, model, selection)
+        responses = load_prototype_response(args, s, model, selection)
+        response = response_scores(q, s, model, selection, responses)
         delta = adapted['delta'].to(args.device)
         scores['LAMP_F'] = scores['LAMP'] + q['features'] @ delta.T - response @ delta.T
     test = {name: dict(correct=correct(value, q['labels']), count=len(q['labels']),
@@ -315,11 +310,117 @@ def evaluate(args):
     print(json.dumps(report, indent=2), flush=True)
 
 
-def response_scores(q, s, model, selection):
+def load_selected_model(args):
+    selection = json.loads((args.output / 'selection.json').read_text())
+    if sha(args.output / 'model.pt') != selection['model_sha256']:
+        raise RuntimeError('Selected model changed')
+    for name, expected in selection['feature_sha256'].items():
+        if sha(args.output / (name + '.pt')) != expected:
+            raise RuntimeError('Fit input changed: ' + name)
+    model = device_copy(torch.load(args.output / 'model.pt', weights_only=True, map_location='cpu'), args.device)
+    recorded = {key: value for key, value in selection.items() if key != 'model_sha256'}
+    if model.get('selection') != recorded:
+        raise RuntimeError('Selection record differs from the selected model')
+    return selection, model
+
+
+def active_responses(model, selection):
+    row = selection['regional_parameters']
+    expected = 3 if row['rho'] else 0
+    if len(model['branches']) != expected:
+        raise RuntimeError('Selected regional branches do not match the mixture')
+    return row['rho'] != 1, [row['weights'][i] != 0 for i in range(expected)]
+
+
+def validate_responses(responses, s, model, selection):
+    global_active, regional_active = active_responses(model, selection)
+    if len(responses['regional']) != len(regional_active):
+        raise RuntimeError('Prototype response branch count differs from selected model')
+    for active, value in zip([global_active, *regional_active],
+                             [responses['global'], *responses['regional']]):
+        if active and (not torch.is_tensor(value) or value.shape != s['features'].shape
+                       or value.dtype != s['features'].dtype or not torch.isfinite(value).all()):
+            raise RuntimeError('Invalid selected-branch prototype response')
+
+
+def legacy_responses(model, selection):
+    """Read responses embedded in older selected models without changing them."""
+    global_active, regional_active = active_responses(model, selection)
+    return {'global': model.get('response_global') if global_active else None,
+            'regional': [branch.get('response') if active else None
+                         for branch, active in zip(model['branches'], regional_active)]}
+
+
+def cached_responses(args, selection):
+    path, seal_path = args.output / 'prototype_response.pt', args.output / 'prototype_response.json'
+    if not path.is_file() or not seal_path.is_file():
+        return None
+    seal = json.loads(seal_path.read_text())
+    if seal['kernel_selection_sha256'] != sha(args.output / 'selection.json'):
+        return None
+    if sha(path) != seal['response_sha256']:
+        raise RuntimeError('Cached prototype response changed')
+    return device_copy(torch.load(path, weights_only=True, map_location='cpu'), args.device)
+
+
+@torch.inference_mode()
+def prepare_prototype_response(args, s, model, selection):
+    """Prepare B = L S only for active selected branches, during adaptation."""
+    responses = cached_responses(args, selection)
+    if responses is not None:
+        validate_responses(responses, s, model, selection)
+        return responses
+    started = time.perf_counter()
+    responses = legacy_responses(model, selection)
+    global_active, regional_active = active_responses(model, selection)
+    beta, lam = (selection['global_parameters'][key] for key in ('beta', 'lambda'))
+    solved = 0
+    if global_active and responses['global'] is None:
+        responses['global'] = solve(global_gram(s['features'], beta), s['features'], lam)
+        solved += 1
+    for i, (branch, active) in enumerate(zip(model['branches'], regional_active)):
+        if active and responses['regional'][i] is None:
+            gram, state = center_support(region_gram(s['native'][i], branch['beta']))
+            if any(not torch.equal(state[key], branch['state'][key]) for key in state):
+                raise RuntimeError('Support calibration changed during response preparation')
+            responses['regional'][i] = solve(gram, s['features'], lam)
+            solved += 1
+    validate_responses(responses, s, model, selection)
+    elapsed = time.perf_counter() - started
+    path = args.output / 'prototype_response.pt'
+    temporary = path.with_suffix('.pt.tmp')
+    torch.save(cpu(responses), temporary)
+    temporary.replace(path)
+    write(args.output / 'prototype_response.json', dict(
+        kernel_selection_sha256=sha(args.output / 'selection.json'), response_sha256=sha(path),
+        active_global=global_active, active_regional=regional_active, new_solves=solved,
+        preparation_seconds=elapsed,
+        timing_scope='Selected-branch response construction and solves; excludes serialization, query responses and optimization'))
+    return responses
+
+
+def load_prototype_response(args, s, model, selection):
+    """Evaluation reads prepared responses and never fits a new system."""
+    responses = cached_responses(args, selection)
+    if responses is None:
+        responses = legacy_responses(model, selection)
+    try:
+        validate_responses(responses, s, model, selection)
+    except RuntimeError as error:
+        raise RuntimeError('Prototype responses are unavailable; run --method both --stage adapt first') from error
+    return responses
+
+
+def response_scores(q, s, model, selection, responses=None):
+    if responses is None:
+        responses = legacy_responses(model, selection)
+    validate_responses(responses, s, model, selection)
     beta = selection['global_parameters']['beta']
-    g_response = global_response(q['features'], s['features'], model['response_global'], beta)
-    terms = [native_delta(xq, xs, dict(branch, alpha=branch['response']))
-             for xq, xs, branch in zip(q['native'], s['native'], model['branches'])]
+    g_response = (global_response(q['features'], s['features'], responses['global'], beta)
+                  if responses['global'] is not None else torch.zeros_like(q['features']))
+    terms = [native_delta(xq, xs, dict(branch, alpha=response))
+             if response is not None else torch.zeros_like(g_response)
+             for xq, xs, branch, response in zip(q['native'], s['native'], model['branches'], responses['regional'])]
     return mix(torch.zeros_like(g_response), g_response, terms, selection['regional_parameters'])
 
 
@@ -363,13 +464,12 @@ class WarmupCosine(torch.optim.lr_scheduler.LRScheduler):
 
 
 def adapt(args, bank):
-    selection = json.loads((args.output / 'selection.json').read_text())
-    if sha(args.output / 'model.pt') != selection['model_sha256']: raise RuntimeError('Kernel model changed')
+    selection, model = load_selected_model(args)
     s, q, text = [load_feature(args, name) for name in ('support','validation','text')]
-    model = device_copy(torch.load(args.output / 'model.pt', weights_only=True), args.device)
     with torch.no_grad():
+        responses = prepare_prototype_response(args, s, model, selection)
         free = free_scores(q, s, text, model, selection)
-        response = response_scores(q, s, model, selection)
+        response = response_scores(q, s, model, selection, responses)
         text = text.T.contiguous()
         direction = F.normalize(text, dim=-1)
         logits = s['features'].float() @ text.float().T
@@ -428,6 +528,7 @@ def adapt(args, bank):
     torch.save(best,args.output/'prototype.pt')
     seal = dict(selected=best['selected'],candidates=33,minibatches_sha256=plan_sha,
                 support_only_updates=True,step_zero_exact=True,kernel_selection_sha256=sha(args.output/'selection.json'),
+                prototype_response_sha256=sha(args.output/'prototype_response.pt'),
                 prototype_sha256=sha(args.output/'prototype.pt'))
     write(args.output/'prototype_selection.json',seal)
 
@@ -436,6 +537,10 @@ def load_adapted(args):
     seal = json.loads((args.output/'prototype_selection.json').read_text())
     if sha(args.output/'selection.json') != seal['kernel_selection_sha256']: raise RuntimeError('Kernel selection changed')
     if sha(args.output/'prototype.pt') != seal['prototype_sha256']: raise RuntimeError('Selected prototype changed')
+    if 'prototype_response_sha256' in seal:
+        path = args.output / 'prototype_response.pt'
+        if not path.is_file() or sha(path) != seal['prototype_response_sha256']:
+            raise RuntimeError('Prototype response differs from the selected prototype run')
     return torch.load(args.output/'prototype.pt',map_location='cpu',weights_only=True)
 
 
@@ -497,18 +602,13 @@ def main():
     torch.backends.cudnn.allow_tf32 = args.backbone != 'RN50'
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = args.backbone == 'RN50'
-    runtime = dict(python=platform.python_version(), torch=torch.__version__, torchvision=torchvision.__version__,
-                   numpy=np.__version__, pillow=pillow_version, cuda_build=torch.version.cuda,
-                   device=torch.cuda.get_device_name(args.device), batch_size=args.batch_size, workers=args.workers,
+    runtime = dict(schema_version=2, environment=execution_environment(args.device),
+                   batch_size=args.batch_size, workers=args.workers,
+                   dense_limit=args.dense_limit, lu_tile=args.lu_tile,
                    source_sha256={x.name: sha(x) for x in HERE.glob('*.py')}, bank_sha256=args.bank_sha256,
                    config_sha256={name: sha(HERE / 'configs' / name) for name in ('global_grid.json', 'checkpoints.json')},
                    invocation={k:str(v) for k,v in vars(args).items()})
-    previous = args.output / 'runtime.json'
-    if previous.exists():
-        old = json.loads(previous.read_text())
-        for field in ('source_sha256','config_sha256','bank_sha256','batch_size'):
-            if old[field] != runtime[field]: raise RuntimeError('Resumed execution inputs changed: ' + field)
-    else: write(previous, runtime)
+    record_runtime(args.output / 'runtime.json', runtime)
     if args.stage in ('encode', 'all'): encode(args, bank, ['support', 'validation'])
     if args.stage in ('select', 'all'): select(args)
     if args.method == 'both' and args.stage in ('adapt', 'all'): adapt(args, bank)
